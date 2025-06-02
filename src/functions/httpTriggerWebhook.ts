@@ -1,6 +1,28 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from "@azure/functions";
+// import { ServiceBusClient } from "@azure/service-bus"; // No longer directly used here
+import { AzureServiceBusService, IServiceBusService } from '../serviceBusService'; // Import the new service
 
-export async function httpTriggerWebhook(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
+// Define interfaces for SharePoint webhook notifications
+// Place these at the top of your file or in a dedicated types.ts
+interface SharePointNotification {
+    subscriptionId: string;
+    clientState?: string; // Optional, if you set it during subscription
+    expirationDateTime: string;
+    resource: string;     // ID of the list (or other resource)
+    tenantId: string;
+    siteUrl: string;      // Server-relative URL of the site (e.g., /sites/MySite)
+    webId: string;
+    changeType?: string;  // This is the field in question. Mark as optional for now.
+}
+
+interface SharePointNotificationPayload {
+    value: SharePointNotification[];
+}
+
+export async function httpTriggerWebhook(
+    request: HttpRequest,
+    context: InvocationContext
+): Promise<HttpResponseInit> {
     context.log(`Http function processed request for url "${request.url}"`);
 
     const name = request.query.get('name') || await request.text() || 'world';
@@ -8,6 +30,17 @@ export async function httpTriggerWebhook(request: HttpRequest, context: Invocati
     return { body: `Hello, ${name}!` };
 };
 export async function validateTokenHandler(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
+    // This is the function registered with Azure Functions.
+    // It calls the core logic, allowing the core logic to be tested with a mock.
+    return actualValidateTokenHandler(request, context, undefined);
+}
+
+// This function contains the core logic and can be called directly by tests with a mock service.
+export async function actualValidateTokenHandler(
+    request: HttpRequest,
+    context: InvocationContext,
+    serviceBusServiceOverride?: IServiceBusService // Allow injecting a mock for testing
+): Promise<HttpResponseInit> {
     context.log(`Validate Token function processed request for url "${request.url}", method: ${request.method}`);
 
     try {
@@ -27,23 +60,83 @@ export async function validateTokenHandler(request: HttpRequest, context: Invoca
             } else {
                 // This is a notification request from SharePoint.
                 // The payload is in the request body.
-                const notificationPayload = await request.text(); // Or request.json() if notifications are JSON.
-                
-                if (!notificationPayload) {
-                    context.log("Notification POST request body is missing or empty.");
+                let parsedPayload: SharePointNotificationPayload;
+                try {
+                    // SharePoint sends notifications as JSON.
+                    parsedPayload = await request.json() as SharePointNotificationPayload;
+                } catch (e) {
+                    context.error("Error parsing notification payload as JSON:", e instanceof Error ? e.message : String(e));
+                    // Log the raw text if JSON parsing fails, for debugging
+                    try {
+                        const rawPayloadForError = await request.text(); // Attempt to read as text for logging
+                        context.log("Raw notification payload (on JSON parse error):", rawPayloadForError);
+                    } catch (textError) {
+                        context.error("Could not even read raw payload as text after JSON parse error:", textError);
+                    }
                     return {
                         status: 400, // Bad Request
-                        body: "Notification body is missing or empty."
+                        body: "Invalid JSON payload for notification."
                     };
                 }
 
-                context.log(`SharePoint notification POST request. Body content: "${notificationPayload}".`);
-                // TODO: Process the notification payload (notificationPayload) here.
-                // For example, queue it for asynchronous processing, save to a database, etc.
+                if (!parsedPayload) {
+                    context.log("Notification payload is empty or not in the expected format (missing 'value' array).");
+                    // Log the parsed payload if it exists but is not as expected
+                    if(parsedPayload) context.log("Received payload structure (malformed?):", JSON.stringify(parsedPayload));
+                    return {
+                        status: 400, // Bad Request
+                        body: "Notification payload is empty or malformed."
+                    };
+                }
+
+                // CRUCIAL LOGGING: Log the entire parsed payload to inspect its structure.
+                context.log(`Received notification(s). Full payload: ${JSON.stringify(parsedPayload, null, 2)}`);
+
+                // Attempt to send notifications to Azure Service Bus
+                const connectionString = process.env.SERVICE_BUS_CONNECTION_STRING;
+                const queueName = process.env.SERVICE_BUS_QUEUE_NAME;
+
+                if (connectionString && queueName) {
+                    const sbService = serviceBusServiceOverride || new AzureServiceBusService(connectionString, queueName);
+                    const messagesToSend = [];
+
+                    for (const notification of parsedPayload.value) {
+                        context.log(`Processing individual notification for Service Bus: SubscriptionId: ${notification.subscriptionId}, Resource (ListID): ${notification.resource}, SiteUrl: ${notification.siteUrl}`);
+
+                        if (notification.changeType) {
+                            context.log(`  ChangeType found: ${notification.changeType}`);
+                            // Now you can use notification.changeType to determine the event
+                            // e.g., if (notification.changeType === 'added') { /* ... */ }
+                        } else {
+                            context.warn(`  WARNING: 'changeType' field is missing in this notification object: ${JSON.stringify(notification, null, 2)}`);
+                            // If changeType is consistently missing, you'll need to investigate your webhook subscription
+                            // or the specific SharePoint event source.
+                        }
+
+                        messagesToSend.push({
+                            body: notification, // Send the entire notification object
+                            contentType: "application/json",
+                            // You could add a messageId or other properties if needed
+                            // messageId: `${notification.subscriptionId}_${new Date().toISOString()}`
+                        });
+                    }
+
+                    if (messagesToSend.length > 0) {
+                        try {
+                            await sbService.sendMessages(messagesToSend, context);
+                            // Logging related to successful send is now within AzureServiceBusService
+                        } catch (sbError) {
+                            // Error is already logged by AzureServiceBusService.
+                            // Depending on your requirements, you might want to implement a retry mechanism
+                            // or dead-lettering for failed messages. For now, we log and continue.
+                        }
+                    }
+                } else {
+                    context.warn("Service Bus environment variables (SERVICE_BUS_CONNECTION_STRING or SERVICE_BUS_QUEUE_NAME) are not set. Skipping message queuing.");
+                }
                 // SharePoint expects a quick response (within 5 seconds typically for notifications too).
                 // A 202 Accepted is good if processing is asynchronous.
-                // A 200 OK is fine if processing is synchronous and fast.
-                return { status: 202, body: "Notification acknowledged" }; 
+                return { status: 202, body: "Notification acknowledged and queued for processing." };
             }
         } else if (request.method === 'GET') {
             // This endpoint is configured to accept GET, but SharePoint webhooks (validation/notification) use POST.
@@ -71,7 +164,7 @@ export async function validateTokenHandler(request: HttpRequest, context: Invoca
 
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
-        context.error(`Error processing validateTokenHandler: ${errorMessage}`);
+        context.error(`Error processing actualValidateTokenHandler: ${errorMessage}`);
         return {
             status: 500,
             body: "An internal error occurred while processing the request."
@@ -82,7 +175,7 @@ export async function validateTokenHandler(request: HttpRequest, context: Invoca
 app.http('tokenEndpoint', {
     methods: ['GET','POST'],
     authLevel: 'anonymous',
-    handler: validateTokenHandler
+    handler: validateTokenHandler // The registered handler remains validateTokenHandler
 });
 
 
